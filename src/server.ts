@@ -33,6 +33,9 @@ const AUTH_DIR = path.resolve(process.env.AUTH_DIR ?? "./auth");
 const MAX_PER_MINUTE = intEnv("MAX_PER_MINUTE", 6);
 const MAX_PER_DAY = intEnv("MAX_PER_DAY", 100);
 const TRUST_PROXY = process.env.TRUST_PROXY === "1";
+// Phone number (digits only, with country code, no +) used for pairing-code auth.
+// If set, the server requests a text code instead of a QR image — more reliable on cloud hosts.
+const PHONE_NUMBER = (process.env.PHONE_NUMBER ?? "").replace(/\D/g, "");
 
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 const baileysLogger = log.child({ module: "baileys" }, { level: "warn" });
@@ -102,11 +105,12 @@ function extractText(raw: { message?: unknown }): string {
 
 // ---------- WhatsApp connection ----------
 
-type Status = "starting" | "connecting" | "qr" | "open" | "logged_out";
+type Status = "starting" | "connecting" | "qr" | "pairing" | "open" | "logged_out";
 
 let sock: WASocket | null = null;
 let status: Status = "starting";
 let qrDataUrl: string | null = null;
+let pairingCode: string | null = null;
 let me: string | null = null;
 let attempts = 0;
 let reconnectTimer: NodeJS.Timeout | null = null;
@@ -127,11 +131,28 @@ async function connect(): Promise<void> {
       logger: baileysLogger,
       browser: Browsers.macOS("Desktop"),
       markOnlineOnConnect: false,
+      printQRInTerminal: false,
     });
     sock = socket;
 
     socket.ev.on("creds.update", saveCreds);
     socket.ev.on("connection.update", (update) => { void handleConnectionUpdate(socket, update); });
+
+    // Pairing-code flow: call this right after socket creation, before the QR would appear.
+    // More reliable than QR on cloud/datacenter IPs.
+    if (PHONE_NUMBER && !state.creds.registered) {
+      try {
+        const code = await socket.requestPairingCode(PHONE_NUMBER);
+        if (socket === sock) {
+          pairingCode = code;
+          status = "pairing";
+          log.info({ code }, "pairing code ready — enter it in WhatsApp → Linked devices → Link with phone number");
+          broadcastSSE({ type: "status", status, pairingCode });
+        }
+      } catch (err) {
+        log.error({ err }, "failed to get pairing code");
+      }
+    }
 
     socket.ev.on("messages.upsert", ({ messages, type }) => {
       if (socket !== sock) return;
@@ -183,6 +204,7 @@ async function handleConnectionUpdate(
   if (update.connection === "open") {
     status = "open";
     qrDataUrl = null;
+    pairingCode = null;
     attempts = 0;
     me = socket.user?.id.split(":")[0]?.split("@")[0] ?? null;
     log.info({ me }, "WhatsApp connected");
@@ -194,6 +216,7 @@ async function handleConnectionUpdate(
       ?.statusCode;
     sock = null;
     qrDataUrl = null;
+    pairingCode = null;
     me = null;
 
     if (code === DisconnectReason.loggedOut) {
@@ -287,7 +310,7 @@ app.get("/healthz", (_req, res) => { res.json({ ok: true }); });
 
 app.get("/api/status", requireAuth, (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  res.json({ status, me, qr: qrDataUrl });
+  res.json({ status, me, qr: qrDataUrl, pairingCode });
 });
 
 // Real-time SSE stream (uses fetch + ReadableStream on the client for auth header support)
@@ -299,7 +322,7 @@ app.get("/api/stream", requireAuth, (req, res) => {
   res.flushHeaders();
 
   // send current state immediately so the client doesn't have to poll
-  res.write("data: " + JSON.stringify({ type: "status", status, me, qr: qrDataUrl }) + "\n\n");
+  res.write("data: " + JSON.stringify({ type: "status", status, me, qr: qrDataUrl, pairingCode }) + "\n\n");
 
   const hb = setInterval(() => {
     try { res.write(": heartbeat\n\n"); } catch { clearInterval(hb); sseClients.delete(res); }

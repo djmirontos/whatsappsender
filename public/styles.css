@@ -116,6 +116,16 @@ input, textarea {
 .steps { margin: 0; padding-left: 1.3em; font-size: 0.85rem; color: var(--muted); justify-self: stretch; }
 .steps li { margin-bottom: 4px; }
 
+.pairing-hint { margin: 0; font-size: 0.88rem; color: var(--muted); text-align: center; }
+.pairing-code {
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-size: 2rem; font-weight: 800; letter-spacing: 0.1em;
+  color: var(--accent); background: var(--bg);
+  border: 2px dashed var(--line); border-radius: 12px;
+  padding: 16px 24px; text-align: center; justify-self: stretch;
+}
+.pairing-note { margin: 0; font-size: 0.78rem; color: var(--muted); text-align: center; }
+
 /* top bar */
 .topbar {
   background: var(--surface); border-bottom: 1px solid var(--line);

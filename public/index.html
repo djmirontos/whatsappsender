@@ -25,16 +25,36 @@
 <!-- App -->
 <div id="app-screen" hidden>
 
-  <!-- QR overlay when WhatsApp needs linking -->
+  <!-- Overlay: shown when WhatsApp needs linking (QR or pairing code) -->
   <div id="qr-overlay" hidden>
     <div class="qr-card">
-      <p class="qr-title">Link your WhatsApp number</p>
-      <img id="qr-img" alt="QR code to link WhatsApp" width="260" height="260">
-      <ol class="steps">
-        <li>Open WhatsApp on your phone</li>
-        <li>Go to <strong>Settings → Linked devices</strong></li>
-        <li>Tap <strong>Link a device</strong> and scan this code</li>
-      </ol>
+
+      <!-- QR mode -->
+      <div id="qr-mode" hidden>
+        <p class="qr-title">Link your WhatsApp number</p>
+        <img id="qr-img" alt="QR code to link WhatsApp" width="260" height="260">
+        <ol class="steps">
+          <li>Open WhatsApp on your phone</li>
+          <li>Go to <strong>Settings → Linked devices</strong></li>
+          <li>Tap <strong>Link a device</strong> and scan this code</li>
+        </ol>
+      </div>
+
+      <!-- Pairing code mode -->
+      <div id="pairing-mode" hidden>
+        <p class="qr-title">Link your WhatsApp number</p>
+        <p class="pairing-hint">Enter this code in WhatsApp on your phone</p>
+        <div class="pairing-code" id="pairing-code-display"></div>
+        <ol class="steps">
+          <li>Open WhatsApp on your phone</li>
+          <li>Go to <strong>Settings → Linked devices</strong></li>
+          <li>Tap <strong>Link a device</strong></li>
+          <li>Tap <strong>"Link with phone number"</strong></li>
+          <li>Enter your number, then type the code above</li>
+        </ol>
+        <p class="pairing-note">Code expires in ~3 minutes. Reload if it stops working.</p>
+      </div>
+
     </div>
   </div>
 

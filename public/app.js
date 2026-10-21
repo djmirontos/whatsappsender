@@ -89,10 +89,10 @@
 
   const STATUS_LABEL = {
     starting: "Starting", connecting: "Connecting", qr: "Link needed",
-    open: "Connected", logged_out: "Unlinked",
+    pairing: "Link needed", open: "Connected", logged_out: "Unlinked",
   };
 
-  function applyStatus({ status, me, qr }) {
+  function applyStatus({ status, me, qr, pairingCode }) {
     const badge = $("badge");
     badge.textContent = STATUS_LABEL[status] ?? status;
     badge.dataset.state = status;
@@ -102,10 +102,25 @@
     $("unlink-btn").hidden = !connected;
     updateSendState();
 
-    const showQR = status === "qr" && !!qr;
-    $("qr-overlay").hidden = !showQR;
-    if (showQR) $("qr-img").src = qr;
-    else $("qr-img").src = "";
+    const showOverlay = (status === "qr" && !!qr) || (status === "pairing" && !!pairingCode);
+    $("qr-overlay").hidden = !showOverlay;
+
+    if (status === "qr" && qr) {
+      $("qr-mode").hidden = false;
+      $("pairing-mode").hidden = true;
+      $("qr-img").src = qr;
+    } else if (status === "pairing" && pairingCode) {
+      $("qr-mode").hidden = true;
+      $("pairing-mode").hidden = false;
+      // format as XXXX - XXXX
+      const digits = pairingCode.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+      $("pairing-code-display").textContent =
+        digits.length === 8 ? digits.slice(0, 4) + " - " + digits.slice(4) : pairingCode;
+    } else {
+      $("qr-mode").hidden = true;
+      $("pairing-mode").hidden = true;
+      $("qr-img").src = "";
+    }
   }
 
   function stopSSE() {
