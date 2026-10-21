@@ -3,76 +3,94 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WA Quick Send</title>
+  <title>WA Messenger</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main class="wrap">
-    <header>
-      <h1>WA Quick Send</h1>
-      <p>Type a message here and it goes out from your own WhatsApp number.</p>
-    </header>
 
-    <section id="login" class="panel">
-      <form id="login-form" novalidate>
-        <div class="field">
-          <label for="password">Password</label>
-          <input id="password" type="password" autocomplete="current-password" required>
-        </div>
-        <p class="error" id="login-error" role="alert" hidden></p>
-        <button class="btn" type="submit">Sign in</button>
-      </form>
-    </section>
+<!-- Login -->
+<div id="login-screen">
+  <div class="login-card">
+    <h1>WA Messenger</h1>
+    <p class="subtitle">Your WhatsApp, from any browser.</p>
+    <form id="login-form" novalidate>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required placeholder="Enter your password">
+      <p class="error" id="login-error" role="alert" hidden></p>
+      <button class="btn" type="submit">Sign in</button>
+    </form>
+  </div>
+</div>
 
-    <div id="app" hidden>
-      <section class="panel" aria-label="Connection">
-        <div class="status-row">
-          <span class="label">WhatsApp</span>
-          <span class="badge" id="badge" data-state="starting">Starting</span>
-        </div>
-        <p class="note" id="status-text">Checking connection…</p>
-        <div id="qr-block" hidden>
-          <img id="qr" alt="QR code to link WhatsApp" width="280" height="280">
-          <ol class="steps">
-            <li>Open WhatsApp on your phone.</li>
-            <li>Go to Settings, then Linked devices.</li>
-            <li>Tap Link a device and scan this code.</li>
-          </ol>
-        </div>
-        <div class="row-actions">
-          <button class="btn ghost" id="unlink" type="button" hidden>Unlink number</button>
-          <button class="btn ghost" id="signout" type="button">Sign out</button>
-        </div>
-      </section>
+<!-- App -->
+<div id="app-screen" hidden>
 
-      <form class="panel" id="send-form" novalidate>
-        <div class="field">
-          <span class="label" id="to-label">Send to</span>
-          <div class="row">
-            <select id="cc" aria-labelledby="to-label" aria-label="Country code"></select>
-            <input id="number" type="tel" inputmode="tel" autocomplete="off" placeholder="917 123 4567" aria-labelledby="to-label" aria-describedby="target">
-          </div>
-          <div class="meta" id="target" aria-live="polite"></div>
-        </div>
-
-        <div class="field">
-          <label for="message">Message</label>
-          <textarea id="message" maxlength="4000" placeholder="Write your message"></textarea>
-          <div class="meta"><span id="count">0 / 4000</span><span>Ctrl+Enter to send</span></div>
-        </div>
-
-        <p class="error" id="send-error" role="alert" hidden></p>
-        <p class="success" id="send-ok" role="status" hidden></p>
-        <button class="btn" id="send" type="submit" disabled>Send message</button>
-      </form>
-
-      <section class="panel" aria-label="Sent this session">
-        <span class="label">Sent this session</span>
-        <ul class="log" id="log"></ul>
-        <p class="note" id="log-empty">Nothing sent yet.</p>
-      </section>
+  <!-- QR overlay when WhatsApp needs linking -->
+  <div id="qr-overlay" hidden>
+    <div class="qr-card">
+      <p class="qr-title">Link your WhatsApp number</p>
+      <img id="qr-img" alt="QR code to link WhatsApp" width="260" height="260">
+      <ol class="steps">
+        <li>Open WhatsApp on your phone</li>
+        <li>Go to <strong>Settings → Linked devices</strong></li>
+        <li>Tap <strong>Link a device</strong> and scan this code</li>
+      </ol>
     </div>
-  </main>
-  <script src="/app.js" defer></script>
+  </div>
+
+  <header class="topbar">
+    <span class="app-name">WA Messenger</span>
+    <div class="topbar-right">
+      <span class="badge" id="badge" data-state="starting">Starting</span>
+      <span class="me-num" id="me-num"></span>
+      <button class="topbar-btn" id="unlink-btn" hidden>Unlink</button>
+      <button class="topbar-btn" id="signout-btn">Sign out</button>
+    </div>
+  </header>
+
+  <div class="layout">
+
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <button class="btn-new" id="new-chat-btn">+ New chat</button>
+      </div>
+
+      <div id="new-chat-panel" class="new-chat-panel" hidden>
+        <input id="new-number" type="tel" inputmode="numeric"
+               placeholder="Number with country code, e.g. 12125551234">
+        <div class="new-chat-row">
+          <button class="btn-sm" id="new-chat-open">Open</button>
+          <button class="btn-sm ghost" id="new-chat-cancel">Cancel</button>
+        </div>
+        <p class="error" id="new-chat-error" hidden></p>
+      </div>
+
+      <div id="conv-list"></div>
+      <p id="conv-empty" class="list-empty">No conversations yet.<br>Start one with the button above.</p>
+    </aside>
+
+    <main class="chat-main">
+      <div id="empty-state" class="empty-state">
+        <p>Select a conversation<br>or start a new one.</p>
+      </div>
+
+      <div id="chat-view" hidden>
+        <div class="chat-header">
+          <span class="chat-contact" id="chat-contact"></span>
+        </div>
+        <div class="message-list" id="message-list"></div>
+        <form class="compose-area" id="compose-form" novalidate>
+          <textarea id="compose-text" placeholder="Type a message… (Ctrl+Enter to send)"
+                    maxlength="4000" rows="1"></textarea>
+          <button class="send-btn" id="compose-send" type="submit" disabled>Send</button>
+        </form>
+        <p class="error compose-error" id="compose-error" role="alert" hidden></p>
+      </div>
+    </main>
+
+  </div>
+</div>
+
+<script src="/app.js" defer></script>
 </body>
 </html>

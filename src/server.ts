@@ -37,6 +37,69 @@ const TRUST_PROXY = process.env.TRUST_PROXY === "1";
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 const baileysLogger = log.child({ module: "baileys" }, { level: "warn" });
 
+// ---------- message store ----------
+
+interface StoredMessage {
+  id: string;
+  jid: string;
+  fromMe: boolean;
+  text: string;
+  timestamp: number; // ms
+}
+
+const chatStore = new Map<string, StoredMessage[]>();
+const MAX_MSGS_PER_CHAT = 200;
+
+function storeMessage(msg: StoredMessage): boolean {
+  const list = chatStore.get(msg.jid) ?? [];
+  if (list.some((m) => m.id === msg.id)) return false;
+  list.push(msg);
+  if (list.length > MAX_MSGS_PER_CHAT) list.shift();
+  chatStore.set(msg.jid, list);
+  return true;
+}
+
+// ---------- SSE ----------
+
+const sseClients = new Set<Response>();
+
+function broadcastSSE(payload: object): void {
+  const chunk = "data: " + JSON.stringify(payload) + "\n\n";
+  for (const res of sseClients) {
+    try { res.write(chunk); } catch { sseClients.delete(res); }
+  }
+}
+
+// ---------- helpers ----------
+
+function tsToMs(ts: unknown): number {
+  if (ts == null) return Date.now();
+  if (typeof ts === "number") return ts * 1000;
+  if (typeof ts === "object" && "toNumber" in (ts as object)) {
+    return (ts as { toNumber(): number }).toNumber() * 1000;
+  }
+  return Date.now();
+}
+
+function extractText(raw: { message?: unknown }): string {
+  const m = raw.message as Record<string, unknown> | null | undefined;
+  if (!m) return "[no content]";
+  if (typeof m["conversation"] === "string") return m["conversation"];
+  const ext = m["extendedTextMessage"] as { text?: string } | undefined;
+  if (ext?.text) return ext.text;
+  const img = m["imageMessage"] as { caption?: string } | undefined;
+  if (img) return img.caption ? `[Photo] ${img.caption}` : "[Photo]";
+  const vid = m["videoMessage"] as { caption?: string } | undefined;
+  if (vid) return vid.caption ? `[Video] ${vid.caption}` : "[Video]";
+  if (m["audioMessage"]) return "[Voice message]";
+  const doc = m["documentMessage"] as { fileName?: string } | undefined;
+  if (doc) return `[Document: ${doc.fileName ?? "file"}]`;
+  if (m["stickerMessage"]) return "[Sticker]";
+  if (m["contactMessage"]) return "[Contact]";
+  if (m["locationMessage"]) return "[Location]";
+  return "[Unsupported message]";
+}
+
 // ---------- WhatsApp connection ----------
 
 type Status = "starting" | "connecting" | "qr" | "open" | "logged_out";
@@ -50,10 +113,7 @@ let reconnectTimer: NodeJS.Timeout | null = null;
 
 function scheduleReconnect(delayMs: number): void {
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    void connect();
-  }, delayMs);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; void connect(); }, delayMs);
 }
 
 async function connect(): Promise<void> {
@@ -71,9 +131,30 @@ async function connect(): Promise<void> {
     sock = socket;
 
     socket.ev.on("creds.update", saveCreds);
+    socket.ev.on("connection.update", (update) => { void handleConnectionUpdate(socket, update); });
 
-    socket.ev.on("connection.update", (update) => {
-      void handleConnectionUpdate(socket, update);
+    socket.ev.on("messages.upsert", ({ messages, type }) => {
+      if (socket !== sock) return;
+      if (type !== "notify" && type !== "append") return;
+      for (const raw of messages) {
+        if (!raw.message) continue;
+        const jid = raw.key.remoteJid;
+        if (!jid || jid.endsWith("@broadcast")) continue;
+        // skip protocol / key-distribution messages
+        const m = raw.message as Record<string, unknown>;
+        if (m["protocolMessage"] || m["senderKeyDistributionMessage"]) continue;
+
+        const stored: StoredMessage = {
+          id: raw.key.id ?? `${jid}-${Date.now()}`,
+          jid,
+          fromMe: raw.key.fromMe ?? false,
+          text: extractText(raw),
+          timestamp: tsToMs(raw.messageTimestamp),
+        };
+        if (storeMessage(stored)) {
+          broadcastSSE({ type: "message", jid, message: stored });
+        }
+      }
     });
   } catch (err) {
     log.error({ err }, "failed to start WhatsApp connection");
@@ -86,15 +167,17 @@ async function handleConnectionUpdate(
   socket: WASocket,
   update: { connection?: string; qr?: string; lastDisconnect?: { error?: Error } },
 ): Promise<void> {
-  if (socket !== sock) return; // stale socket
+  if (socket !== sock) return;
 
   if (update.qr) {
     qrDataUrl = await QRCode.toDataURL(update.qr, { margin: 2, width: 280 });
     status = "qr";
+    broadcastSSE({ type: "status", status, qr: qrDataUrl });
   }
 
   if (update.connection === "connecting" && status !== "qr") {
     status = "connecting";
+    broadcastSSE({ type: "status", status });
   }
 
   if (update.connection === "open") {
@@ -103,6 +186,7 @@ async function handleConnectionUpdate(
     attempts = 0;
     me = socket.user?.id.split(":")[0]?.split("@")[0] ?? null;
     log.info({ me }, "WhatsApp connected");
+    broadcastSSE({ type: "status", status, me });
   }
 
   if (update.connection === "close") {
@@ -115,6 +199,7 @@ async function handleConnectionUpdate(
     if (code === DisconnectReason.loggedOut) {
       log.warn("logged out from the phone, clearing session");
       status = "logged_out";
+      broadcastSSE({ type: "status", status });
       await rm(AUTH_DIR, { recursive: true, force: true });
       attempts = 0;
       scheduleReconnect(1_000);
@@ -122,12 +207,13 @@ async function handleConnectionUpdate(
       status = "connecting";
       attempts += 1;
       log.warn({ code, attempts }, "connection closed, reconnecting");
+      broadcastSSE({ type: "status", status });
       scheduleReconnect(Math.min(30_000, 2_000 * attempts));
     }
   }
 }
 
-// ---------- limits ----------
+// ---------- rate limits ----------
 
 const sentAt: number[] = [];
 
@@ -197,15 +283,49 @@ app.use(express.json({ limit: "10kb" }));
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 app.use(express.static(publicDir));
 
-app.get("/healthz", (_req, res) => {
-  res.json({ ok: true });
-});
+app.get("/healthz", (_req, res) => { res.json({ ok: true }); });
 
 app.get("/api/status", requireAuth, (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json({ status, me, qr: qrDataUrl });
 });
 
+// Real-time SSE stream (uses fetch + ReadableStream on the client for auth header support)
+app.get("/api/stream", requireAuth, (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
+  res.flushHeaders();
+
+  // send current state immediately so the client doesn't have to poll
+  res.write("data: " + JSON.stringify({ type: "status", status, me, qr: qrDataUrl }) + "\n\n");
+
+  const hb = setInterval(() => {
+    try { res.write(": heartbeat\n\n"); } catch { clearInterval(hb); sseClients.delete(res); }
+  }, 25_000);
+
+  sseClients.add(res);
+  req.on("close", () => { clearInterval(hb); sseClients.delete(res); });
+});
+
+// List conversations sorted by most-recent message
+app.get("/api/conversations", requireAuth, (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const convs = Array.from(chatStore.entries())
+    .map(([jid, msgs]) => ({ jid, lastMessage: msgs.at(-1) ?? null }))
+    .sort((a, b) => (b.lastMessage?.timestamp ?? 0) - (a.lastMessage?.timestamp ?? 0));
+  res.json(convs);
+});
+
+// Messages for a single conversation
+app.get("/api/messages/:jid", requireAuth, (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const jid = decodeURIComponent(req.params["jid"] ?? "");
+  res.json(chatStore.get(jid) ?? []);
+});
+
+// Send a message
 app.post("/api/send", requireAuth, async (req, res) => {
   const parsed = sendSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -215,7 +335,7 @@ app.post("/api/send", requireAuth, async (req, res) => {
 
   const socket = sock;
   if (!socket || status !== "open") {
-    res.status(503).json({ error: "WhatsApp isn't connected. Check the status at the top of the page." });
+    res.status(503).json({ error: "WhatsApp isn't connected. Check the status indicator." });
     return;
   }
 
@@ -244,13 +364,28 @@ app.post("/api/send", requireAuth, async (req, res) => {
     const result = await socket.sendMessage(jid, { text: message });
     sentAt.push(Date.now());
     log.info({ to }, "message sent");
-    res.json({ ok: true, id: result?.key.id ?? null });
+
+    if (result) {
+      const stored: StoredMessage = {
+        id: result.key.id ?? `sent-${Date.now()}`,
+        jid,
+        fromMe: true,
+        text: message,
+        timestamp: Date.now(),
+      };
+      if (storeMessage(stored)) {
+        broadcastSSE({ type: "message", jid, message: stored });
+      }
+    }
+
+    res.json({ ok: true, id: result?.key.id ?? null, jid });
   } catch (err) {
     log.error({ err }, "send failed");
     res.status(502).json({ error: "WhatsApp didn't accept the message. Try again in a moment." });
   }
 });
 
+// Unlink this device
 app.post("/api/logout", requireAuth, async (_req, res) => {
   const socket = sock;
   try {

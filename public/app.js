@@ -1,241 +1,440 @@
 (() => {
-  const $ = (id) => document.getElementById(id);
+  "use strict";
 
-  const COUNTRIES = [
-    ["PH", "63"], ["US", "1"], ["CA", "1"], ["GB", "44"], ["AU", "61"], ["SG", "65"], ["MY", "60"],
-    ["HK", "852"], ["JP", "81"], ["KR", "82"], ["IN", "91"], ["AE", "971"], ["SA", "966"],
-    ["IT", "39"], ["GR", "30"], ["DE", "49"], ["ES", "34"], ["NO", "47"], ["ZA", "27"],
-  ];
-  const STATUS_COPY = {
-    starting: ["Starting", "Starting up…"],
-    connecting: ["Connecting", "Connecting to WhatsApp…"],
-    qr: ["Link needed", "Scan the code below with your phone to link your number."],
-    open: ["Connected", ""],
-    logged_out: ["Unlinked", "This number was unlinked. A new code will appear shortly."],
-  };
-  const KEY = "wa-sender:password";
+  const $ = (id) => document.getElementById(id);
+  const KEY = "wa:pw";
+
+  // ---------- state ----------
 
   let password = "";
-  try { password = sessionStorage.getItem(KEY) || ""; } catch { /* storage unavailable */ }
-  let pollTimer = null;
+  try { password = sessionStorage.getItem(KEY) || ""; } catch {}
+
   let connected = false;
-  let sending = false;
-  let lastQr = null;
+  let currentJid = null;
+  let sseController = null;
+
+  const conversations = new Map(); // jid -> { jid, lastMessage }
+  const messages = new Map();      // jid -> StoredMessage[]
 
   // ---------- api ----------
 
   async function api(path, options = {}) {
     const res = await fetch(path, {
       ...options,
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + password },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + password,
+        ...(options.headers ?? {}),
+      },
     });
     let body = null;
-    try { body = await res.json(); } catch { /* empty body */ }
-    if (res.status === 401) {
-      signOut("Wrong password.");
-      throw new Error("unauthorized");
-    }
-    if (!res.ok) throw new Error((body && body.error) || "Request failed (" + res.status + ").");
+    try { body = await res.json(); } catch {}
+    if (res.status === 401) { signOut("Wrong password."); throw new Error("unauthorized"); }
+    if (!res.ok) throw new Error(body?.error || `Request failed (${res.status}).`);
     return body;
   }
 
-  // ---------- sign in / out ----------
+  // ---------- auth ----------
 
-  function showLogin(message) {
-    clearTimeout(pollTimer);
-    $("app").hidden = true;
-    $("login").hidden = false;
+  function showLogin(msg) {
+    stopSSE();
+    $("login-screen").hidden = false;
+    $("app-screen").hidden = true;
     const err = $("login-error");
-    err.hidden = !message;
-    err.textContent = message || "";
-    $("password").focus();
+    err.hidden = !msg;
+    err.textContent = msg || "";
+    setTimeout(() => $("password").focus(), 0);
   }
 
-  function signOut(message) {
+  function signOut(msg) {
     password = "";
-    try { sessionStorage.removeItem(KEY); } catch { /* ignore */ }
-    showLogin(message);
-  }
-
-  function showApp() {
-    $("login").hidden = true;
-    $("app").hidden = false;
+    currentJid = null;
+    conversations.clear();
+    messages.clear();
+    try { sessionStorage.removeItem(KEY); } catch {}
+    showLogin(msg);
   }
 
   $("login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    password = $("password").value;
-    if (!password) return;
+    const pw = $("password").value.trim();
+    if (!pw) return;
+    password = pw;
     try {
-      const s = await api("/api/status");
-      try { sessionStorage.setItem(KEY, password); } catch { /* ignore */ }
+      await api("/api/status");
+      try { sessionStorage.setItem(KEY, password); } catch {}
       $("password").value = "";
-      showApp();
-      renderStatus(s);
-      schedulePoll(s.status === "open" ? 10000 : 2000);
+      $("login-screen").hidden = true;
+      $("app-screen").hidden = false;
+      await loadInitialData();
+      startSSE();
     } catch (err) {
-      if (err.message !== "unauthorized") showLogin(err.message);
+      if (err.message !== "unauthorized") {
+        const el = $("login-error");
+        el.textContent = err.message;
+        el.hidden = false;
+      }
     }
   });
 
-  $("signout").addEventListener("click", () => signOut(""));
+  $("signout-btn").addEventListener("click", () => signOut(""));
 
-  $("unlink").addEventListener("click", async () => {
-    if (!confirm("Unlink this number from the server? You'll need to scan a new QR code to use it again.")) return;
-    try {
-      await api("/api/logout", { method: "POST" });
-    } catch (err) {
-      if (err.message !== "unauthorized") setSendMessage(err.message, false);
-    }
+  $("unlink-btn").addEventListener("click", async () => {
+    if (!confirm("Unlink this number from the server? You'll need to scan a new QR code to reconnect.")) return;
+    try { await api("/api/logout", { method: "POST" }); }
+    catch (err) { if (err.message !== "unauthorized") alert(err.message); }
   });
 
-  // ---------- status ----------
+  // ---------- status / SSE ----------
 
-  function renderStatus(s) {
-    const [label, text] = STATUS_COPY[s.status] || STATUS_COPY.starting;
+  const STATUS_LABEL = {
+    starting: "Starting", connecting: "Connecting", qr: "Link needed",
+    open: "Connected", logged_out: "Unlinked",
+  };
+
+  function applyStatus({ status, me, qr }) {
     const badge = $("badge");
-    badge.textContent = label;
-    badge.dataset.state = s.status;
-    $("status-text").textContent = s.status === "open" && s.me ? "Sending as +" + s.me : text;
+    badge.textContent = STATUS_LABEL[status] ?? status;
+    badge.dataset.state = status;
 
-    connected = s.status === "open";
-    $("unlink").hidden = !connected;
-
-    const showQr = s.status === "qr" && !!s.qr;
-    $("qr-block").hidden = !showQr;
-    if (showQr && s.qr !== lastQr) {
-      $("qr").src = s.qr;
-      lastQr = s.qr;
-    }
-    if (!showQr) lastQr = null;
+    connected = status === "open";
+    $("me-num").textContent = me ? "+" + me : "";
+    $("unlink-btn").hidden = !connected;
     updateSendState();
+
+    const showQR = status === "qr" && !!qr;
+    $("qr-overlay").hidden = !showQR;
+    if (showQR) $("qr-img").src = qr;
+    else $("qr-img").src = "";
   }
 
-  function schedulePoll(ms) {
-    clearTimeout(pollTimer);
-    pollTimer = setTimeout(poll, ms);
+  function stopSSE() {
+    if (sseController) { sseController.abort(); sseController = null; }
   }
 
-  async function poll() {
+  async function startSSE() {
+    while (true) {
+      if (!password) break;
+      try {
+        const controller = new AbortController();
+        sseController = controller;
+        const resp = await fetch("/api/stream", {
+          headers: { "Authorization": "Bearer " + password },
+          signal: controller.signal,
+        });
+        if (!resp.ok || !resp.body) { await sleep(5000); continue; }
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const parts = buf.split("\n\n");
+          buf = parts.pop() ?? "";
+          for (const part of parts) {
+            for (const line of part.split("\n")) {
+              if (line.startsWith("data: ")) {
+                try { handleSSE(JSON.parse(line.slice(6))); } catch {}
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (err?.name === "AbortError") break;
+      }
+      await sleep(3000);
+    }
+  }
+
+  function handleSSE(data) {
+    if (data.type === "status") {
+      applyStatus(data);
+    } else if (data.type === "message") {
+      const { jid, message } = data;
+      ingestMessage(jid, message);
+    }
+  }
+
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  // ---------- data loading ----------
+
+  async function loadInitialData() {
     try {
-      const s = await api("/api/status");
-      renderStatus(s);
-      schedulePoll(s.status === "open" ? 10000 : 2000);
+      const [statusData, convData] = await Promise.all([
+        api("/api/status"),
+        api("/api/conversations"),
+      ]);
+      applyStatus(statusData);
+      for (const conv of convData) {
+        conversations.set(conv.jid, conv);
+      }
+      renderConvList();
     } catch (err) {
-      if (err.message === "unauthorized") return;
-      $("status-text").textContent = "Can't reach the server. Retrying…";
-      schedulePoll(5000);
+      if (err.message !== "unauthorized") console.warn("loadInitialData:", err.message);
     }
   }
 
-  // ---------- send form ----------
-
-  const ccEl = $("cc");
-  COUNTRIES.forEach(([code, dial]) => {
-    const o = document.createElement("option");
-    o.value = dial;
-    o.textContent = code + " +" + dial;
-    ccEl.appendChild(o);
-  });
-
-  function computeNumber() {
-    const raw = $("number").value.trim();
-    const digits = raw.replace(/\D/g, "");
-    if (!digits) return { empty: true, valid: false };
-    let full;
-    if (raw.startsWith("+")) full = digits;
-    else if (digits.startsWith("00")) full = digits.replace(/^0+/, "");
-    else full = ccEl.value + digits.replace(/^0+/, "");
-    if (full.length < 8 || full.length > 15) {
-      return { valid: false, full, reason: "That number looks too " + (full.length > 15 ? "long" : "short") + ". Check the digits." };
+  async function loadMessages(jid) {
+    if (messages.has(jid)) return;
+    try {
+      const msgs = await api("/api/messages/" + encodeURIComponent(jid));
+      messages.set(jid, msgs);
+    } catch (err) {
+      if (err.message !== "unauthorized") console.warn("loadMessages:", err.message);
+      messages.set(jid, []);
     }
-    return { valid: true, full };
   }
+
+  // ---------- conversations ----------
+
+  function ingestMessage(jid, msg) {
+    // store in message cache
+    const list = messages.get(jid) ?? [];
+    if (!list.some((m) => m.id === msg.id)) {
+      list.push(msg);
+      messages.set(jid, list);
+    }
+    // update conversation preview
+    const conv = conversations.get(jid) ?? { jid, lastMessage: null };
+    conv.lastMessage = msg;
+    conversations.set(jid, conv);
+    renderConvList();
+    // append bubble if this chat is open
+    if (jid === currentJid) {
+      appendBubble(msg, true);
+    }
+  }
+
+  function jidDisplay(jid) {
+    return "+" + jid.replace(/@.*$/, "");
+  }
+
+  function renderConvList() {
+    const list = $("conv-list");
+    const empty = $("conv-empty");
+    list.innerHTML = "";
+
+    const sorted = Array.from(conversations.values())
+      .sort((a, b) => (b.lastMessage?.timestamp ?? 0) - (a.lastMessage?.timestamp ?? 0));
+
+    empty.hidden = sorted.length > 0;
+
+    for (const conv of sorted) {
+      const item = document.createElement("div");
+      item.className = "conv-item" + (conv.jid === currentJid ? " active" : "");
+      item.dataset.jid = conv.jid;
+
+      const name = document.createElement("div");
+      name.className = "conv-name";
+      name.textContent = jidDisplay(conv.jid);
+
+      const preview = document.createElement("div");
+      preview.className = "conv-preview";
+      if (conv.lastMessage) {
+        preview.textContent = (conv.lastMessage.fromMe ? "You: " : "") + conv.lastMessage.text;
+      }
+
+      const timeEl = document.createElement("div");
+      timeEl.className = "conv-time";
+      if (conv.lastMessage) timeEl.textContent = fmtTime(conv.lastMessage.timestamp);
+
+      item.appendChild(name);
+      item.appendChild(preview);
+      item.appendChild(timeEl);
+      item.addEventListener("click", () => void openChat(conv.jid));
+      list.appendChild(item);
+    }
+  }
+
+  // ---------- chat view ----------
+
+  async function openChat(jid) {
+    currentJid = jid;
+    $("empty-state").hidden = true;
+    $("chat-view").hidden = false;
+    $("chat-contact").textContent = jidDisplay(jid);
+    $("message-list").innerHTML = "";
+    $("compose-error").hidden = true;
+    $("compose-text").value = "";
+    updateSendState();
+    renderConvList(); // refresh active highlight
+
+    await loadMessages(jid);
+    const msgs = messages.get(jid) ?? [];
+    $("message-list").innerHTML = "";
+    for (const msg of msgs) appendBubble(msg, false);
+    scrollBottom();
+    $("compose-text").focus();
+  }
+
+  function appendBubble(msg, animate) {
+    const list = $("message-list");
+    const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+
+    // deduplicate DOM
+    if (list.querySelector(`[data-id="${CSS.escape(msg.id)}"]`)) return;
+
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + (msg.fromMe ? "out" : "in");
+    wrap.dataset.id = msg.id;
+    if (animate) wrap.style.opacity = "0";
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = msg.text;
+
+    const time = document.createElement("div");
+    time.className = "msg-time";
+    time.textContent = fmtTime(msg.timestamp);
+
+    wrap.appendChild(bubble);
+    wrap.appendChild(time);
+    list.appendChild(wrap);
+
+    if (animate) {
+      requestAnimationFrame(() => {
+        wrap.style.transition = "opacity 0.15s";
+        wrap.style.opacity = "1";
+      });
+    }
+
+    if (nearBottom || msg.fromMe) scrollBottom();
+  }
+
+  function scrollBottom() {
+    const list = $("message-list");
+    list.scrollTop = list.scrollHeight;
+  }
+
+  // ---------- compose ----------
 
   function updateSendState() {
-    const r = computeNumber();
-    const msg = $("message").value.trim();
-    $("count").textContent = $("message").value.length + " / 4000";
-
-    const target = $("target");
-    target.textContent = "";
-    if (r.valid) {
-      const span = document.createElement("span");
-      span.className = "target";
-      span.textContent = "Sending to +" + r.full;
-      target.appendChild(span);
-    } else if (!r.empty) {
-      const span = document.createElement("span");
-      span.className = "err";
-      span.textContent = r.reason;
-      target.appendChild(span);
-    }
-    $("send").disabled = sending || !connected || !r.valid || !msg;
+    const text = $("compose-text")?.value.trim() ?? "";
+    const btn = $("compose-send");
+    if (btn) btn.disabled = !connected || !text || !currentJid;
   }
 
-  function setSendMessage(text, ok) {
-    const err = $("send-error");
-    const good = $("send-ok");
-    err.hidden = ok || !text;
-    good.hidden = !ok || !text;
-    (ok ? good : err).textContent = text || "";
-  }
-
-  function addLog(number) {
-    $("log-empty").hidden = true;
-    const li = document.createElement("li");
-    const n = document.createElement("span");
-    n.className = "num";
-    n.textContent = "+" + number;
-    const t = document.createElement("span");
-    t.className = "time";
-    t.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    li.appendChild(n);
-    li.appendChild(t);
-    const list = $("log");
-    list.prepend(li);
-    while (list.children.length > 10) list.removeChild(list.lastChild);
-  }
-
-  async function send() {
-    const r = computeNumber();
-    const message = $("message").value.trim();
-    if (!r.valid || !message || !connected || sending) return;
-    sending = true;
-    setSendMessage("", true);
-    $("send").textContent = "Sending…";
+  $("compose-text").addEventListener("input", () => {
     updateSendState();
+    autoGrow($("compose-text"));
+  });
+
+  $("compose-text").addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      void doSend();
+    }
+  });
+
+  $("compose-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    void doSend();
+  });
+
+  async function doSend() {
+    if (!connected || !currentJid) return;
+    const text = $("compose-text").value.trim();
+    if (!text) return;
+
+    const jid = currentJid;
+    const to = jid.replace(/@.*$/, "");
+
+    $("compose-text").value = "";
+    $("compose-text").style.height = "";
+    updateSendState();
+    $("compose-error").hidden = true;
+
     try {
-      await api("/api/send", { method: "POST", body: JSON.stringify({ to: r.full, message }) });
-      addLog(r.full);
-      setSendMessage("Sent to +" + r.full + ".", true);
-      $("message").value = "";
+      const result = await api("/api/send", {
+        method: "POST",
+        body: JSON.stringify({ to, message: text }),
+      });
+      // Optimistically show the message; SSE will also deliver it — dedup by id prevents doubles
+      const localMsg = {
+        id: result.id ?? ("local-" + Date.now()),
+        jid: result.jid ?? jid,
+        fromMe: true,
+        text,
+        timestamp: Date.now(),
+      };
+      ingestMessage(localMsg.jid, localMsg);
     } catch (err) {
-      if (err.message !== "unauthorized") setSendMessage(err.message, false);
-    } finally {
-      sending = false;
-      $("send").textContent = "Send message";
-      updateSendState();
+      if (err.message !== "unauthorized") {
+        const el = $("compose-error");
+        el.textContent = err.message;
+        el.hidden = false;
+        // restore the text so the user doesn't lose their message
+        $("compose-text").value = text;
+        updateSendState();
+      }
     }
   }
 
-  $("send-form").addEventListener("submit", (e) => { e.preventDefault(); void send(); });
-  $("message").addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); void send(); }
+  function autoGrow(el) {
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 120) + "px";
+  }
+
+  // ---------- new chat ----------
+
+  $("new-chat-btn").addEventListener("click", () => {
+    const panel = $("new-chat-panel");
+    const showing = !panel.hidden;
+    panel.hidden = showing;
+    if (!showing) {
+      $("new-number").value = "";
+      $("new-chat-error").hidden = true;
+      $("new-number").focus();
+    }
   });
-  ["input", "change"].forEach((ev) => {
-    ccEl.addEventListener(ev, updateSendState);
-    $("number").addEventListener(ev, updateSendState);
-    $("message").addEventListener(ev, updateSendState);
+
+  $("new-chat-cancel").addEventListener("click", () => {
+    $("new-chat-panel").hidden = true;
   });
+
+  $("new-number").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); openNewChat(); }
+  });
+
+  $("new-chat-open").addEventListener("click", openNewChat);
+
+  function openNewChat() {
+    const raw = $("new-number").value.replace(/\D/g, "");
+    const err = $("new-chat-error");
+    if (raw.length < 8 || raw.length > 15) {
+      err.textContent = "Enter a valid number with country code — digits only, 8 to 15 digits (e.g. 12125551234).";
+      err.hidden = false;
+      return;
+    }
+    err.hidden = true;
+    $("new-chat-panel").hidden = true;
+    const jid = raw + "@s.whatsapp.net";
+    if (!conversations.has(jid)) {
+      conversations.set(jid, { jid, lastMessage: null });
+      renderConvList();
+    }
+    void openChat(jid);
+  }
+
+  // ---------- utils ----------
+
+  function fmtTime(ms) {
+    const d = new Date(ms);
+    const isToday = new Date().toDateString() === d.toDateString();
+    return isToday
+      ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
 
   // ---------- boot ----------
 
   updateSendState();
   if (password) {
-    api("/api/status")
-      .then((s) => { showApp(); renderStatus(s); schedulePoll(s.status === "open" ? 10000 : 2000); })
-      .catch((err) => { if (err.message !== "unauthorized") showLogin(err.message); });
+    $("login-screen").hidden = true;
+    $("app-screen").hidden = false;
+    loadInitialData().then(() => startSSE());
   } else {
     showLogin("");
   }
